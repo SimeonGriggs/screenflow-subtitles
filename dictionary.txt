@@ -1,0 +1,6 @@
+# Spelling corrections for whisper transcription
+# Format: WRONG=RIGHT (one per line)
+# These are loaded automatically by screenflow-subtitles.py
+
+Vitesse=Vitess
+Niki=Neki
