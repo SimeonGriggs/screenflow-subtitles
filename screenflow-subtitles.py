@@ -188,6 +188,61 @@ def rechunk_segments(segments: list[dict], max_chars: int = 39) -> list[dict]:
     return chunked
 
 
+def linger_segments(segments: list[dict]) -> list[dict]:
+    """Extend each segment's end time to the next segment's start time.
+
+    This eliminates blank gaps between subtitles by keeping each subtitle
+    on screen until the next one appears. The last segment is left unchanged.
+    """
+    if len(segments) <= 1:
+        return segments
+    for i in range(len(segments) - 1):
+        next_start = segments[i + 1]["start"]
+        if next_start > segments[i]["end"]:
+            segments[i]["end"] = next_start
+    return segments
+
+
+def expand_segments_to_word_highlights(segments: list[dict]) -> list[dict]:
+    """Expand each segment into per-word sub-clips for word highlighting.
+
+    Each segment like {"start": 0.0, "end": 1.0, "text": "Don't sleep"}
+    becomes two sub-clips:
+      - {"start": 0.0, "end": 0.5, "text": "Don't sleep", "highlight_word": 0}
+      - {"start": 0.5, "end": 1.0, "text": "Don't sleep", "highlight_word": 1}
+
+    The full text is preserved in each sub-clip, and "highlight_word" indicates
+    which word (by index) should be highlighted in orange. Timing is distributed
+    proportionally by character count of each word.
+    """
+    expanded = []
+    for seg in segments:
+        words = seg["text"].split()
+        if len(words) <= 1:
+            # Single word or empty — just highlight the whole thing
+            expanded.append({**seg, "highlight_word": 0})
+            continue
+
+        # Distribute time proportionally by word character length
+        word_lengths = [len(w) for w in words]
+        total_chars = sum(word_lengths)
+        seg_duration = seg["end"] - seg["start"]
+
+        cum_chars = 0
+        for i, w in enumerate(words):
+            t_start = seg["start"] + (cum_chars / total_chars) * seg_duration
+            cum_chars += word_lengths[i]
+            t_end = seg["start"] + (cum_chars / total_chars) * seg_duration
+            expanded.append({
+                "start": round(t_start, 6),
+                "end": round(t_end, 6),
+                "text": seg["text"],
+                "highlight_word": i,
+            })
+
+    return expanded
+
+
 # ---------------------------------------------------------------------------
 # Whisper transcription
 # ---------------------------------------------------------------------------
@@ -664,6 +719,14 @@ class SharedPool:
         self.shadow_color = plistlib.UID(make_ns_color_rgba(objects, 0, 0, 0, 1.0))
         self.bg_color = plistlib.UID(make_ns_color_rgba(objects, 0, 0, 0, 0.75))
         self.text_color = plistlib.UID(make_ns_color_rgba(objects, 1, 1, 1, 1.0))
+        self.highlight_color = plistlib.UID(
+            make_ns_color_rgba(objects, 0.9529411764705882, 0.34509803921568627, 0.08235294117647059, 1.0)
+        )
+
+        # NSMutableData class for NSAttributeInfo
+        self.mdata_cls = find_or_create_class(
+            objects, "NSMutableData", ["NSMutableData", "NSData", "NSObject"]
+        )
 
         # Font and paragraph style
         self.font = plistlib.UID(make_ns_font(objects, font_name, font_size))
@@ -688,6 +751,7 @@ class SharedPool:
         self.uuid = plistlib.UID(add_object(objects, str(uuid.uuid4()).upper()))
 
         # Shared NSAttributedString attribute dict (font, color, para style)
+        # White text attributes (default / non-highlighted)
         attr_key_names = [
             "NSParagraphStyle", "NSStrokeWidth", "Fill", "Stroke",
             "FillType", "NSFont", "NSColor",
@@ -703,6 +767,19 @@ class SharedPool:
             "$class": plistlib.UID(dict_cls),
         }
         self.text_attr_dict = plistlib.UID(add_object(objects, text_attr_dict))
+
+        # Orange (highlighted) text attributes
+        hl_attr_keys = [plistlib.UID(add_object(objects, k)) for k in attr_key_names]
+        hl_attr_vals = [
+            self.para_style, self.int[3], self.true, self.false,
+            self.int[0], self.font, self.highlight_color,
+        ]
+        hl_text_attr_dict = {
+            "NS.keys": hl_attr_keys,
+            "NS.objects": hl_attr_vals,
+            "$class": plistlib.UID(dict_cls),
+        }
+        self.highlight_attr_dict = plistlib.UID(add_object(objects, hl_text_attr_dict))
 
     def _make_build_params(self, objects, dict_cls):
         """Create a build animation params dict. Returns UID index."""
@@ -791,11 +868,70 @@ def inject_subtitles(
 
         # --- TextClip ---
         text_string_uid = plistlib.UID(add_object(objects, seg["text"]))
-        attr_str_uid = plistlib.UID(add_object(objects, {
-            "NSString": text_string_uid,
-            "NSAttributes": pool.text_attr_dict,
-            "$class": plistlib.UID(pool.attr_str_cls),
-        }))
+
+        highlight_word = seg.get("highlight_word")
+        if highlight_word is not None:
+            # Build NSAttributedString with per-word color runs
+            words = seg["text"].split()
+
+            # Build the runs by walking through the text character by character
+            # grouping consecutive chars with the same attribute index.
+            # attr_index 0 = white (non-highlighted), 1 = orange (highlighted)
+            current_runs = []
+            for wi, word in enumerate(words):
+                if wi > 0:
+                    # Space before word — assign to the preceding word's attribute
+                    current_runs.append((1, 1 if wi - 1 == highlight_word else 0))
+                # The word itself
+                attr_idx = 1 if wi == highlight_word else 0
+                current_runs.append((len(word), attr_idx))
+
+            # Merge adjacent runs with same attr_index
+            merged_runs = []
+            for char_count, attr_idx in current_runs:
+                if merged_runs and merged_runs[-1][1] == attr_idx:
+                    merged_runs[-1] = (merged_runs[-1][0] + char_count, attr_idx)
+                else:
+                    merged_runs.append((char_count, attr_idx))
+
+            if len(merged_runs) == 1:
+                # Single run (e.g., single-word segment) — no NSAttributeInfo needed
+                single_attr = pool.highlight_attr_dict if merged_runs[0][1] == 1 else pool.text_attr_dict
+                attr_str_uid = plistlib.UID(add_object(objects, {
+                    "NSString": text_string_uid,
+                    "NSAttributes": single_attr,
+                    "$class": plistlib.UID(pool.attr_str_cls),
+                }))
+            else:
+                # Multiple runs — use NSAttributeInfo + NSAttributes array
+                info_bytes = bytearray()
+                for char_count, attr_idx in merged_runs:
+                    info_bytes.append(char_count)
+                    info_bytes.append(attr_idx)
+
+                info_data_uid = plistlib.UID(add_object(objects, {
+                    "NS.data": bytes(info_bytes),
+                    "$class": plistlib.UID(pool.mdata_cls),
+                }))
+
+                # NSAttributes is an array: [white_attrs, orange_attrs]
+                ns_attrs_array = plistlib.UID(add_object(objects, {
+                    "NS.objects": [pool.text_attr_dict, pool.highlight_attr_dict],
+                    "$class": plistlib.UID(pool.array_cls),
+                }))
+
+                attr_str_uid = plistlib.UID(add_object(objects, {
+                    "NSString": text_string_uid,
+                    "NSAttributeInfo": info_data_uid,
+                    "NSAttributes": ns_attrs_array,
+                    "$class": plistlib.UID(pool.attr_str_cls),
+                }))
+        else:
+            attr_str_uid = plistlib.UID(add_object(objects, {
+                "NSString": text_string_uid,
+                "NSAttributes": pool.text_attr_dict,
+                "$class": plistlib.UID(pool.attr_str_cls),
+            }))
         start_uid = plistlib.UID(add_object(objects, start_units))
         dur_uid = plistlib.UID(add_object(objects, duration_units))
 
@@ -1055,6 +1191,16 @@ Examples:
         "--output-dir",
         help="Directory for output files (default: output/ next to ScreenFlow doc)",
     )
+    parser.add_argument(
+        "--no-linger",
+        action="store_true",
+        help="Don't extend subtitle duration to fill gaps between segments",
+    )
+    parser.add_argument(
+        "--no-highlight",
+        action="store_true",
+        help="Don't highlight the current word in orange (use plain white text)",
+    )
 
     args = parser.parse_args()
 
@@ -1096,6 +1242,12 @@ Examples:
         print(f"Applied {len(dictionary)} dictionary correction(s) to segments")
     if args.max_chars and args.max_chars > 0:
         segments = rechunk_segments(segments, args.max_chars)
+
+    # Linger: extend each segment to fill gaps (unless disabled)
+    if not args.no_linger:
+        segments = linger_segments(segments)
+        print("Applied linger (segments extended to fill gaps)")
+
     print(f"\n{len(segments)} subtitle segments:")
     for i, seg in enumerate(segments):
         start_f = f"{int(seg['start']//60):02d}:{seg['start']%60:06.3f}"
@@ -1122,7 +1274,12 @@ Examples:
         sf_stem = sf_stem[: -len(".screenflow")]
     output_path = os.path.join(output_dir, f"{sf_stem}-subtitled.screenflow")
 
-    # Step 4: Inject subtitles
+    # Step 4: Expand segments to per-word highlights (unless disabled)
+    if not args.no_highlight:
+        segments = expand_segments_to_word_highlights(segments)
+        print(f"Expanded to {len(segments)} word-highlighted clips")
+
+    # Step 5: Inject subtitles
     print(f"\nInjecting subtitles into ScreenFlow document...")
     inject_subtitles(
         screenflow_path=args.screenflow,
