@@ -70,6 +70,53 @@ def parse_vtt(path: str) -> list[dict]:
     return segments
 
 
+def split_on_sentences(segments: list[dict]) -> list[dict]:
+    """Split segments at sentence boundaries (.!?) so a single subtitle
+    never straddles two sentences (e.g. "shipped. You also").
+
+    Timing is interpolated proportionally by character position within
+    each original segment, matching rechunk_segments behaviour.
+    """
+    result = []
+    # Regex: sentence-ending punctuation followed by a space and more text.
+    # Captures everything up to and including the punctuation as one part,
+    # and the remainder as another.  Handles multiple sentence breaks.
+    sentence_end = re.compile(r'(?<=[.!?])\s+(?=[A-Za-z])')
+
+    for seg in segments:
+        text = seg["text"]
+        parts = sentence_end.split(text)
+
+        if len(parts) <= 1:
+            result.append(seg)
+            continue
+
+        # Interpolate timing proportionally by character offset
+        total_chars = len(text)
+        seg_duration = seg["end"] - seg["start"]
+        char_offset = 0
+
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if not part:
+                continue
+            # Find where this part starts in the original text
+            part_start = text.index(part, char_offset)
+            part_end = part_start + len(part)
+
+            t_start = round(seg["start"] + (part_start / total_chars) * seg_duration, 3)
+            t_end = round(seg["start"] + (part_end / total_chars) * seg_duration, 3)
+
+            result.append({
+                "start": t_start,
+                "end": t_end,
+                "text": part,
+            })
+            char_offset = part_end
+
+    return result
+
+
 def rechunk_segments(segments: list[dict], max_chars: int = 39) -> list[dict]:
     """Re-chunk subtitle segments so each has at most max_chars characters.
 
@@ -307,6 +354,12 @@ def transcribe(
             "-ovtt",
             "-of", transcript_base,
             "--no-prints",
+            # Disable cross-window context carryover to prevent timestamp
+            # collapse on dense/fast speech.  Without this, accumulated text
+            # context from earlier 30-second windows can overwhelm the
+            # decoder's attention, causing all remaining speech to be
+            # compressed into a few seconds followed by hallucinations.
+            "--max-context", "0",
         ]
         if prompt:
             cmd.extend(["--prompt", prompt])
@@ -1192,6 +1245,11 @@ Examples:
         help="Directory for output files (default: output/ next to ScreenFlow doc)",
     )
     parser.add_argument(
+        "--no-sentence-break",
+        action="store_true",
+        help="Don't split subtitles at sentence boundaries (.!?)",
+    )
+    parser.add_argument(
         "--no-linger",
         action="store_true",
         help="Don't extend subtitle duration to fill gaps between segments",
@@ -1240,6 +1298,9 @@ Examples:
     if dictionary:
         segments = apply_dictionary(segments, dictionary)
         print(f"Applied {len(dictionary)} dictionary correction(s) to segments")
+    if not args.no_sentence_break:
+        segments = split_on_sentences(segments)
+        print("Split segments at sentence boundaries")
     if args.max_chars and args.max_chars > 0:
         segments = rechunk_segments(segments, args.max_chars)
 

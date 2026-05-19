@@ -49,6 +49,7 @@ python3 screenflow-subtitles.py audio.m4a project.screenflow \
 | `--font-size SIZE` | `100` | Font size in points |
 | `--y-position Y` | `-0.671` | Normalized Y position (0 = center, negative = toward bottom) |
 | `--max-chars N` | `39` | Max characters per subtitle line (0 = no limit) |
+| `--no-sentence-break` | — | Don't split subtitles at sentence boundaries (`.!?`) |
 | `--from-vtt PATH` | — | Skip transcription, use an existing VTT file |
 | `--dry-run` | — | Transcribe and print segments only, don't modify the document |
 | `--vtt-only` | — | Output VTT file only, don't write to ScreenFlow |
